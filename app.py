@@ -451,7 +451,8 @@ def advisor_bullets(risk, horizon, score, vol, sharpe, allocation, market_label,
 st.markdown("""
 <style>
 .stApp { background: linear-gradient(180deg,#EAFBF2 0%,#FFFFFF 34%,#F4F8FC 100%); color:#102A43; }
-.block-container { padding-top:1.2rem; max-width:1180px; }
+header[data-testid="stHeader"] { background: transparent; }
+.block-container { padding-top:3.5rem; max-width:1180px; }
 .land-hero { text-align:center; padding:18px 0 6px; }
 .land-logo { font-size:18px; font-weight:900; color:#047857; letter-spacing:.3px; }
 .land-title { font-size:42px; font-weight:900; color:#062E2E; line-height:1.08; margin-top:8px; }
