@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import datetime as dt
 import streamlit as st
@@ -15,9 +16,24 @@ ACCOUNTS_DIR = "accounts"
 os.makedirs(CACHE_DIR, exist_ok=True)
 os.makedirs(ACCOUNTS_DIR, exist_ok=True)
 
-COLORS = ["#10B981", "#0EA5E9", "#8B5CF6", "#F59E0B", "#EF4444", "#14B8A6", "#6366F1"]
+COLORS = ["#10B981", "#0EA5E9", "#8B5CF6", "#F59E0B", "#EF4444", "#14B8A6", "#6366F1", "#EC4899"]
 GOALS = ["Retirement", "A home", "Education", "Building wealth"]
 RISKS = ["Conservative", "Moderate", "Aggressive"]
+
+# Curated universe the AI advisor is allowed to choose from (no hallucinated/penny tickers).
+UNIVERSE = {
+    "US broad market ETF": ["VTI", "VOO"],
+    "US tech/growth ETF": ["QQQ"],
+    "US large-cap stocks": ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "JPM", "JNJ", "PG", "V", "KO"],
+    "Dividend ETF": ["SCHD", "VYM"],
+    "International developed ETF": ["VEA", "VXUS"],
+    "Emerging markets ETF": ["VWO"],
+    "Aggregate bond ETF": ["BND", "AGG"],
+    "Long-term treasury ETF": ["TLT"],
+    "Short-term treasury / cash ETF": ["SHY", "BIL"],
+    "Gold ETF": ["GLD"],
+}
+ALL_TICKERS = sorted({t for v in UNIVERSE.values() for t in v})
 
 
 def _rerun():
@@ -35,7 +51,6 @@ def toggle(label, key):
 
 
 def card():
-    # A bordered container that actually wraps Streamlit widgets (raw HTML divs can't).
     try:
         return st.container(border=True)
     except TypeError:
@@ -52,10 +67,10 @@ def account_path(name):
     return os.path.join(ACCOUNTS_DIR, f"{_safe(name)}.json")
 
 
-def save_account(acct):
+def save_account(a):
     try:
-        with open(account_path(acct["name"]), "w") as f:
-            json.dump(acct, f, indent=2)
+        with open(account_path(a["name"]), "w") as f:
+            json.dump(a, f, indent=2)
     except Exception:
         pass
 
@@ -104,7 +119,7 @@ def parse_weights(text, tickers):
     return np.array([1 / len(tickers)] * len(tickers))
 
 
-# ---------------- DATA LAYER ----------------
+# ---------------- DATA LAYER (auto-refreshing, 10-min cache) ----------------
 
 def _price_path(ticker, period):
     return os.path.join(CACHE_DIR, f"px_{_safe(ticker)}_{period}.csv")
@@ -127,7 +142,7 @@ def _load_prices_from_cache(tickers, period):
     return pd.concat(frames, axis=1).dropna()
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
 def get_stock_data(tickers, period="1y", demo_mode=False):
     tickers = list(tickers)
     if demo_mode:
@@ -148,7 +163,7 @@ def get_stock_data(tickers, period="1y", demo_mode=False):
         return _load_prices_from_cache(tickers, period)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
 def get_dividend_data(tickers, prices=None, demo_mode=False):
     tickers = list(tickers)
     rows = []
@@ -171,7 +186,7 @@ def get_dividend_data(tickers, prices=None, demo_mode=False):
     return pd.DataFrame(rows)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
 def market_conditions(demo_mode=False):
     try:
         spy = get_stock_data(["SPY"], "6mo", demo_mode)["SPY"].dropna()
@@ -199,8 +214,8 @@ def market_conditions(demo_mode=False):
 
 def apply_clean_theme(fig):
     fig.update_layout(template="plotly_white", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(255,255,255,0)",
-                      font=dict(color="#102A43"), title_font=dict(size=20, color="#102A43"),
-                      margin=dict(l=20, r=20, t=55, b=20), legend=dict(bgcolor="rgba(255,255,255,0)", borderwidth=0))
+                      font=dict(color="#102A43"), title_font=dict(size=19, color="#102A43"),
+                      margin=dict(l=20, r=20, t=50, b=20), legend=dict(bgcolor="rgba(255,255,255,0)", borderwidth=0))
     return fig
 
 
@@ -229,6 +244,44 @@ def recommended_portfolio(allocation, equity_tickers):
             w[t] = w.get(t, 0.0) + share
     total = sum(w.values())
     return {t: x / total for t, x in w.items()} if total > 0 else w
+
+
+def build_ai_portfolio(api_key, profile):
+    """Ask the AI to build a SAMPLE portfolio from the curated universe. Returns
+    {"summary":..., "holdings":[{ticker,weight,reason}]} or None on any failure."""
+    if not api_key:
+        return None
+    prompt = f"""You are an educational robo-advisor building a SAMPLE diversified portfolio (this is NOT financial advice).
+Choose 5 to 8 instruments ONLY from this approved list: {ALL_TICKERS}.
+Investor: age {profile['age']}, {profile['risk']} risk tolerance, {profile['horizon']}-year horizon,
+goal "{profile['goal']}", investing about ${profile['monthly']:,.0f}/month.
+Rules: weights are percentages summing to 100; match the equity/bond/cash balance to the risk level and horizon
+(more bonds/cash for conservative or short horizons, more equities for aggressive or long horizons); diversify across
+asset types; pick nothing outside the list.
+Return ONLY valid JSON (no markdown, no prose) in exactly this shape:
+{{"summary":"one short paragraph on the strategy","holdings":[{{"ticker":"VTI","weight":40,"reason":"short reason"}}]}}"""
+    try:
+        from anthropic import Anthropic
+        msg = Anthropic(api_key=api_key).messages.create(
+            model="claude-haiku-4-5-20251001", max_tokens=900,
+            messages=[{"role": "user", "content": prompt}])
+        text = msg.content[0].text
+        match = re.search(r"\{.*\}", text, re.S)
+        data = json.loads(match.group(0))
+        valid = set(ALL_TICKERS)
+        holdings = []
+        for h in data.get("holdings", []):
+            tk = str(h.get("ticker", "")).upper().strip()
+            if tk in valid and float(h.get("weight", 0)) > 0:
+                holdings.append({"ticker": tk, "weight": float(h["weight"]), "reason": str(h.get("reason", ""))[:160]})
+        if not holdings:
+            return None
+        tot = sum(h["weight"] for h in holdings)
+        for h in holdings:
+            h["weight"] = round(h["weight"] / tot * 100, 1)
+        return {"summary": str(data.get("summary", ""))[:600], "holdings": holdings}
+    except Exception:
+        return None
 
 
 def risk_score(age, risk, horizon, monthly, income):
@@ -362,37 +415,24 @@ def advisor_bullets(risk, horizon, score, vol, sharpe, allocation, market_label,
     r.append("Strong Sharpe ratio — good reward for the risk." if sharpe > 1 else ("Weak Sharpe ratio — the mix may not reward its risk well." if sharpe < 0.5 else "Reasonable Sharpe ratio."))
     r.append("Meaningful dividend income that compounds if reinvested." if dy > 0.03 else "Growth here comes mainly from price appreciation.")
     r.append(f"Markets are currently {market_label.lower()}, which the plan accounts for." if market_label else "Market-conditions data is unavailable right now.")
-    r.append(f"Recommended mix: {allocation['Equity']}% equities, {allocation['Bonds / Fixed Income']}% bonds, {allocation['Cash']}% cash.")
+    r.append(f"Recommended balance: {allocation['Equity']}% equities, {allocation['Bonds / Fixed Income']}% bonds, {allocation['Cash']}% cash.")
     return r
-
-
-def generate_ai_note(api_key, profile, metrics, allocation, market_label):
-    prompt = f"""You are FinPilot, an educational robo-advisor. Write a short plain-English note (130-180 words)
-using ONLY these numbers; invent nothing. Flowing prose, no lists. End noting it's educational, not personalised advice.
-Profile: age {profile['age']}, {profile['risk']} risk, {profile['horizon']}-yr horizon, income ${profile['income']:,.0f},
-value ${profile['value']:,.0f}, ${profile['monthly']:,.0f}/mo, risk score {profile['score']}/100.
-Allocation: {allocation['Equity']}% equity, {allocation['Bonds / Fixed Income']}% bonds, {allocation['Cash']}% cash.
-Metrics: expected return {metrics['er']:.2%}, volatility {metrics['vol']:.2%}, Sharpe {metrics['sharpe']:.2f}, yield {metrics['dy']:.2%}.
-Market conditions: {market_label}."""
-    try:
-        from anthropic import Anthropic
-        msg = Anthropic(api_key=api_key).messages.create(model="claude-haiku-4-5-20251001", max_tokens=600,
-                                                          messages=[{"role": "user", "content": prompt}])
-        return msg.content[0].text
-    except Exception:
-        return None
 
 
 # ---------------- STYLE ----------------
 st.markdown("""
 <style>
-.stApp { background: linear-gradient(180deg,#F1FBF6 0%,#FFFFFF 38%,#F6F8FB 100%); color:#102A43; }
+.stApp { background: linear-gradient(180deg,#EAFBF2 0%,#FFFFFF 34%,#F4F8FC 100%); color:#102A43; }
 .block-container { padding-top:1.2rem; max-width:1180px; }
-.acct-bar { display:flex; align-items:center; justify-content:space-between; background:#FFFFFF; border:1px solid #E3EAF0; border-radius:18px; padding:12px 20px; box-shadow:0 8px 24px rgba(16,42,67,0.06); margin-bottom:16px; }
+.land-hero { text-align:center; padding:18px 0 6px; }
+.land-logo { font-size:18px; font-weight:900; color:#047857; letter-spacing:.3px; }
+.land-title { font-size:42px; font-weight:900; color:#062E2E; line-height:1.08; margin-top:8px; }
+.land-sub { font-size:17px; color:#42606A; margin-top:10px; }
+.acct-bar { display:flex; align-items:center; justify-content:space-between; background:#FFFFFF; border:1px solid #E3EAF0; border-radius:18px; padding:12px 20px; box-shadow:0 8px 24px rgba(16,42,67,0.06); margin-bottom:14px; }
 .acct-name { font-size:15px; font-weight:800; color:#102A43; }
 .acct-val { font-size:14px; font-weight:800; color:#047857; }
-.home-wrap { max-width:660px; margin:0 auto; }
-.home-card { background:#FFFFFF; border:1px solid #E3EAF0; border-radius:28px; padding:30px; box-shadow:0 12px 32px rgba(16,42,67,0.07); margin-bottom:16px; }
+.home-wrap { max-width:680px; margin:0 auto; }
+.home-card { background:#FFFFFF; border:1px solid #E3EAF0; border-radius:28px; padding:30px; box-shadow:0 12px 32px rgba(16,42,67,0.07); margin-bottom:14px; }
 .home-label { font-size:14px; color:#52616B; margin-bottom:6px; }
 .value-big { font-size:48px; font-weight:900; color:#062E2E; letter-spacing:-1px; line-height:1; }
 .gain-pos { color:#047857; font-weight:800; font-size:15px; }
@@ -403,17 +443,22 @@ st.markdown("""
 .bar-track { height:10px; background:#EEF2F6; border-radius:999px; overflow:hidden; margin:14px 0 6px; }
 .bar-fill { height:100%; background:linear-gradient(90deg,#10B981,#0EA5E9); border-radius:999px; }
 .home-advisor { background:linear-gradient(135deg,#ECFDF5,#EFF6FF); border:1px solid #BBF7D0; border-radius:18px; padding:16px 18px; font-size:15px; line-height:1.55; color:#0F5132; margin-top:16px; }
-.onb-card { background:#FFFFFF; border:1px solid #E3EAF0; border-radius:28px; padding:34px; box-shadow:0 14px 36px rgba(16,42,67,0.08); }
-.brand { font-size:15px; font-weight:800; color:#047857; margin-bottom:2px; }
-.welcome { font-size:28px; font-weight:900; color:#062E2E; line-height:1.1; }
+.ai-tag { display:inline-block; background:#EDE9FE; color:#5B21B6; padding:3px 12px; border-radius:999px; font-size:12px; font-weight:800; }
+.hold { display:flex; align-items:center; gap:12px; padding:10px 0; border-bottom:1px solid #F0F3F7; }
+.hold-tk { font-weight:900; color:#102A43; width:64px; }
+.hold-bartrack { flex:1; height:8px; background:#EEF2F6; border-radius:999px; overflow:hidden; }
+.hold-barfill { height:100%; background:linear-gradient(90deg,#10B981,#0EA5E9); border-radius:999px; }
+.hold-w { width:48px; text-align:right; font-weight:800; color:#0EA5E9; }
+.hold-reason { font-size:13px; color:#52616B; margin:0 0 8px 76px; }
+.brand { font-size:15px; font-weight:800; color:#047857; }
 .feature-card { background:#FFFFFF; padding:20px; border-radius:22px; border:1px solid #E3EAF0; box-shadow:0 12px 32px rgba(16,42,67,0.07); margin-bottom:14px; }
 .card-title { font-size:20px; font-weight:850; color:#102A43; margin-bottom:4px; }
 .card-text { font-size:14px; color:#52616B; }
 .accent-box { background:linear-gradient(135deg,#ECFDF5,#EFF6FF); border:1px solid #D7F2E4; padding:16px; border-radius:18px; margin-bottom:12px; }
 .advisor-box { background:linear-gradient(135deg,#ECFDF5,#EFF6FF); border:1px solid #BBF7D0; padding:22px; border-radius:22px; font-size:16px; line-height:1.6; }
 div[data-testid="stMetric"] { background:#FFFFFF; border:1px solid #E3EAF0; padding:16px; border-radius:18px; box-shadow:0 10px 26px rgba(16,42,67,0.06); }
-.stTabs [data-baseweb="tab-list"] { gap:12px; background:#FFFFFF; padding:10px; border-radius:999px; border:1px solid #E3EAF0; margin-bottom:20px; }
-.stTabs [data-baseweb="tab"] { height:46px; padding:8px 26px; border-radius:999px; color:#102A43; font-weight:800; }
+.stTabs [data-baseweb="tab-list"] { gap:10px; background:#FFFFFF; padding:8px; border-radius:999px; border:1px solid #E3EAF0; margin-bottom:18px; }
+.stTabs [data-baseweb="tab"] { height:44px; padding:8px 26px; border-radius:999px; color:#102A43; font-weight:800; }
 .stTabs [aria-selected="true"] { background:linear-gradient(135deg,#10B981,#0EA5E9) !important; color:white !important; }
 .stButton > button { background:linear-gradient(135deg,#10B981,#0EA5E9); color:white; border:none; border-radius:999px; padding:0.6rem 1.3rem; font-weight:800; }
 </style>
@@ -425,25 +470,20 @@ ss.setdefault("user", None)
 ss.setdefault("view", "home")
 ss.setdefault("onb_active", False)
 ss.setdefault("onb_step", 1)
-# Automation toggles (always present so they default ON and never error)
-ss.setdefault("auto_deposit", True)
-ss.setdefault("auto_rebalance", True)
-ss.setdefault("auto_dividend", True)
-ss.setdefault("auto_tlh", True)
-# Onboarding answers kept in plain keys (NOT widget keys) so they survive step changes
-ss.setdefault("ans_name", "")
-ss.setdefault("ans_goal", "Retirement")
-ss.setdefault("ans_target", 1000000)
-ss.setdefault("ans_age", 28)
-ss.setdefault("ans_income", 60000)
-ss.setdefault("ans_horizon", 30)
-ss.setdefault("ans_monthly", 1000)
-ss.setdefault("ans_risk", "Moderate")
-ss.setdefault("ans_opening", 10000)
+for k in ("auto_deposit", "auto_rebalance", "auto_dividend", "auto_tlh"):
+    ss.setdefault(k, True)
+for k, v in {"ans_name": "", "ans_goal": "Retirement", "ans_target": 1000000, "ans_age": 28,
+             "ans_income": 60000, "ans_horizon": 30, "ans_monthly": 1000, "ans_risk": "Moderate",
+             "ans_opening": 10000}.items():
+    ss.setdefault(k, v)
+
+try:
+    ANTHROPIC_KEY = st.secrets["ANTHROPIC_API_KEY"]
+except Exception:
+    ANTHROPIC_KEY = None
 
 
 def seed_keys(a):
-    ss["k_name"] = a.get("name", "")
     ss["k_goal"] = a.get("goal", "Retirement")
     ss["k_target"] = int(a.get("target", 1000000))
     ss["k_age"] = int(a.get("age", 28))
@@ -452,10 +492,8 @@ def seed_keys(a):
     ss["k_risk"] = a.get("risk", "Moderate")
     ss["k_horizon"] = int(a.get("horizon", 30))
     ss["k_salary"] = int(a.get("salary_growth", 5))
-    ss["auto_deposit"] = a.get("auto_deposit", True)
-    ss["auto_rebalance"] = a.get("auto_rebalance", True)
-    ss["auto_dividend"] = a.get("auto_dividend", True)
-    ss["auto_tlh"] = a.get("auto_tlh", True)
+    for k in ("auto_deposit", "auto_rebalance", "auto_dividend", "auto_tlh"):
+        ss[k] = a.get(k, True)
     ss["use_own_tickers"] = a.get("use_own", False)
     ss["k_tickers"] = a.get("tickers", "AAPL, MSFT, NVDA, SPY, VYM")
     ss["k_weights"] = a.get("weights_text", "")
@@ -463,36 +501,42 @@ def seed_keys(a):
 
 # ================= LOGIN / ONBOARDING =================
 if ss.user is None:
-    st.markdown('<div class="home-wrap"><div class="brand">FinPilot AI</div></div>', unsafe_allow_html=True)
+    st.markdown("""
+    <div class="land-hero">
+        <div class="land-logo">FinPilot AI</div>
+        <div class="land-title">Investing on autopilot.</div>
+        <div class="land-sub">Answer a few questions and your AI advisor builds, funds, and tracks a portfolio for you.</div>
+    </div>""", unsafe_allow_html=True)
 
-    if not ss.onb_active:
-        cl, cc, cr = st.columns([1, 4, 1])
-        with cc:
-            with card():
-                st.subheader("Welcome to FinPilot")
-                st.write("Open an account and we'll handle the investing for you.")
-                existing = list_accounts()
-                if existing:
-                    st.caption("Continue with an existing account")
-                    for nm in existing:
-                        if st.button(f"Continue as {nm}", key=f"cont_{nm}", use_container_width=True):
-                            a = load_account(nm)
-                            seed_keys(a)
-                            ss.user = nm
-                            ss.view = "home"
-                            _rerun()
-                    st.divider()
-                if st.button("Open a new account", use_container_width=True):
-                    ss.onb_active = True
-                    ss.onb_step = 1
-                    _rerun()
-        st.caption("Educational prototype only. Not financial advice.")
-        st.stop()
-
-    # onboarding wizard (answers stored in plain ans_ keys so they survive step changes)
-    step = ss.onb_step
     cl, cc, cr = st.columns([1, 4, 1])
     with cc:
+        if not ss.onb_active:
+            tab_start, tab_login = st.tabs(["Get started", "Log in"])
+            with tab_start:
+                with card():
+                    st.write("New here? Open an account in under a minute and we'll build your portfolio.")
+                    if st.button("Get started", use_container_width=True):
+                        ss.onb_active = True
+                        ss.onb_step = 1
+                        _rerun()
+            with tab_login:
+                with card():
+                    existing = list_accounts()
+                    if existing:
+                        st.write("Welcome back — choose your account.")
+                        for nm in existing:
+                            if st.button(f"Log in as {nm}", key=f"login_{nm}", use_container_width=True):
+                                seed_keys(load_account(nm))
+                                ss.user = nm
+                                ss.view = "home"
+                                _rerun()
+                    else:
+                        st.caption("No accounts yet — use Get started to create one.")
+            st.caption("Educational prototype only. Not financial advice.")
+            st.stop()
+
+        # onboarding wizard (answers in plain ans_ keys so they survive step changes)
+        step = ss.onb_step
         with card():
             st.caption(f"Step {step} of 4")
             if step == 1:
@@ -529,19 +573,22 @@ if ss.user is None:
                         ss.onb_step += 1
                         _rerun()
                 else:
-                    if st.button("Open my account", use_container_width=True):
+                    if st.button("Build my portfolio", use_container_width=True):
                         name = ss.ans_name or "Investor"
                         opening = int(ss.ans_opening)
                         acct = {
                             "name": name, "created": dt.date.today().isoformat(),
                             "goal": ss.ans_goal, "target": int(ss.ans_target), "age": int(ss.ans_age),
                             "income": int(ss.ans_income), "monthly": int(ss.ans_monthly), "risk": ss.ans_risk,
-                            "horizon": int(ss.ans_horizon), "salary_growth": 5,
-                            "invested": opening,
+                            "horizon": int(ss.ans_horizon), "salary_growth": 5, "invested": opening,
                             "transactions": [{"date": dt.date.today().isoformat(), "type": "Opening deposit", "amount": opening}],
                             "auto_deposit": True, "auto_rebalance": True, "auto_dividend": True, "auto_tlh": True,
                             "use_own": False, "tickers": "AAPL, MSFT, NVDA, SPY, VYM", "weights_text": "",
                         }
+                        with st.spinner("Your AI advisor is building your portfolio…"):
+                            ai = build_ai_portfolio(ANTHROPIC_KEY, {"age": acct["age"], "risk": acct["risk"], "horizon": acct["horizon"], "goal": acct["goal"], "monthly": acct["monthly"]})
+                        if ai:
+                            acct["ai_portfolio"] = ai
                         save_account(acct)
                         seed_keys(acct)
                         ss.user = name
@@ -554,9 +601,8 @@ if ss.user is None:
 
 # ================= LOGGED IN =================
 acct = load_account(ss.user) or {}
-
-# Settings live in the (collapsed) sidebar so the main screen stays product-like.
 name = ss.user
+
 st.sidebar.title("Settings")
 st.sidebar.header("Goal")
 goal_name = st.sidebar.selectbox("Investing for", GOALS, key="k_goal")
@@ -586,7 +632,6 @@ assumed_return = {"Conservative": 0.05, "Moderate": 0.07, "Aggressive": 0.09}[ri
 allocation = recommend_allocation(age, risk_tol, horizon)
 score = risk_score(age, risk_tol, horizon, monthly, income)
 
-# Persist edited settings back to the account
 acct.update({"goal": goal_name, "target": goal_target, "age": age, "income": income, "monthly": monthly,
              "risk": risk_tol, "horizon": horizon, "salary_growth": int(salary_growth * 100),
              "auto_deposit": ss.get("auto_deposit", True), "auto_rebalance": ss.get("auto_rebalance", True),
@@ -596,81 +641,97 @@ save_account(acct)
 
 invested = float(acct.get("invested", 0))
 transactions = acct.get("transactions", [])
+ai_port = acct.get("ai_portfolio")
 
-# Resolve the portfolio + value the account from recent market performance
 mc_read = market_conditions(demo_mode)
 market_label = mc_read["label"] if mc_read else None
-prices, weights, tickers, perf = None, None, [], 0.0
+
+prices, weights, tickers, perf, portfolio_summary, ai_built = None, None, [], 0.0, "", False
 try:
     if ss.use_own_tickers:
         tickers = [t.strip().upper() for t in ticker_input.split(",") if t.strip()]
         prices = get_stock_data(tickers, period, demo_mode)
         tickers = list(prices.columns)
         weights = parse_weights(weights_text, tickers)
-    else:
-        rec = recommended_portfolio(allocation, equity_tickers=["VTI"])
-        req = list(rec.keys())
-        prices = get_stock_data(req, period, demo_mode)
-        tickers = [t for t in req if t in prices.columns]
+    elif ai_port and ai_port.get("holdings"):
+        want = [h["ticker"] for h in ai_port["holdings"]]
+        prices = get_stock_data(want, period, demo_mode)
+        tickers = [t for t in want if t in prices.columns]
         prices = prices[tickers]
-        weights = np.array([rec[t] for t in tickers], dtype=float)
-        weights = weights / weights.sum()
+        wmap = {h["ticker"]: h["weight"] for h in ai_port["holdings"]}
+        w = np.array([wmap[t] for t in tickers], dtype=float)
+        weights = w / w.sum()
+        portfolio_summary = ai_port.get("summary", "")
+        ai_built = True
+    else:
+        rec = recommended_portfolio(allocation, ["VTI"])
+        want = list(rec.keys())
+        prices = get_stock_data(want, period, demo_mode)
+        tickers = [t for t in want if t in prices.columns]
+        prices = prices[tickers]
+        w = np.array([rec[t] for t in tickers], dtype=float)
+        weights = w / w.sum()
     perf = recent_return(prices, weights)
 except Exception:
     prices = None
 
 current_value = invested * (1 + perf)
 gain = current_value - invested
-
-# Shared projection (starts from real balance today)
 home_proj = wealth_projection(current_value, effective_monthly, assumed_return, horizon, contribution_growth)
 projected_value = float(home_proj["Projected Value"].iloc[-1])
 on_track = projected_value >= goal_target
+now_str = dt.datetime.now().strftime("%b %d, %I:%M %p")
 
 
 # ================= HOME =================
 if ss.view == "home":
-    st.markdown(f'<div class="acct-bar"><span class="acct-name">{name}\'s account</span><span class="acct-val">Total value {money(current_value)}</span></div>', unsafe_allow_html=True)
+    bar1, bar2 = st.columns([4, 1])
+    with bar1:
+        st.markdown(f'<div class="acct-bar"><span class="acct-name">{name}\'s account</span><span class="acct-val">Total value {money(current_value)}</span></div>', unsafe_allow_html=True)
+    with bar2:
+        if st.button("↻ Refresh", use_container_width=True):
+            st.cache_data.clear()
+            _rerun()
 
     pct = (projected_value / goal_target) if goal_target > 0 else 1.0
     bar_pct = min(max(pct, 0.0), 1.0) * 100
-    gain_cls = "gain-pos" if gain >= 0 else "gain-neg"
-    gain_sign = "+" if gain >= 0 else "−"
+    gcls = "gain-pos" if gain >= 0 else "gain-neg"
+    gsign = "+" if gain >= 0 else "−"
     pill = '<span class="pill-ok">On track</span>' if on_track else '<span class="pill-warn">Needs a nudge</span>'
+    ai_chip = '<span class="ai-tag">AI-built</span>' if ai_built else ''
     if on_track:
-        advisor_line = f"You're on track to reach your {goal_name.lower()} goal of {money_short(goal_target)}. Keeping your {money(monthly)}/month deposit going gets you there with room to spare."
+        adv = f"You're on track to reach your {goal_name.lower()} goal of {money_short(goal_target)}. Keeping your {money(monthly)}/month deposit going gets you there with room to spare."
     else:
-        advisor_line = f"You're projected to reach {money_short(projected_value)} — a little under your {money_short(goal_target)} goal. Raising your monthly deposit or extending your timeline closes the gap."
+        adv = f"You're projected to reach {money_short(projected_value)} — a little under your {money_short(goal_target)} goal. Raising your monthly deposit or extending your timeline closes the gap."
 
     st.markdown(f"""
     <div class="home-wrap"><div class="home-card">
-      <div class="home-label">Portfolio value</div>
+      <div class="home-label">Portfolio value &nbsp; {ai_chip}</div>
       <div class="value-big">{money(current_value)}</div>
-      <div class="{gain_cls}">{gain_sign}{money(abs(gain))} ({perf:+.1%}) on {money(invested)} invested</div>
+      <div class="{gcls}">{gsign}{money(abs(gain))} ({perf:+.1%}) on {money(invested)} invested</div>
       <div class="bar-track"><div class="bar-fill" style="width:{bar_pct:.0f}%;"></div></div>
       <div class="home-sub">{pill} &nbsp; Projected {money_short(projected_value)} toward your {money_short(goal_target)} goal in {horizon} years</div>
-      <div class="home-advisor">{advisor_line}</div>
+      <div class="home-advisor">{adv}</div>
     </div></div>""", unsafe_allow_html=True)
 
     fig_home = px.area(home_proj, x="Year", y="Projected Value", color_discrete_sequence=["#10B981"])
     fig_home.update_layout(height=240, showlegend=False, xaxis_title=None, yaxis_title=None, title=None)
     st.plotly_chart(apply_clean_theme(fig_home), use_container_width=True)
+    st.caption(f"Prices refresh automatically every few minutes · last loaded {now_str}")
 
-    cwrap = st.container()
-    with cwrap:
-        ad1, ad2 = st.columns([2, 1])
-        with ad1:
-            dep = st.number_input("Add money to your account ($)", min_value=0, value=0, step=500, key="dep_amt")
-        with ad2:
-            st.write("")
-            st.write("")
-            if st.button("Deposit", use_container_width=True):
-                if dep > 0:
-                    acct["invested"] = invested + dep
-                    acct.setdefault("transactions", []).append({"date": dt.date.today().isoformat(), "type": "Deposit", "amount": int(dep)})
-                    save_account(acct)
-                    st.success(f"Added {money(dep)} to your account.")
-                    _rerun()
+    ad1, ad2 = st.columns([2, 1])
+    with ad1:
+        dep = st.number_input("Add money to your account ($)", min_value=0, value=0, step=500, key="dep_amt")
+    with ad2:
+        st.write("")
+        st.write("")
+        if st.button("Deposit", use_container_width=True):
+            if dep > 0:
+                acct["invested"] = invested + dep
+                acct.setdefault("transactions", []).append({"date": dt.date.today().isoformat(), "type": "Deposit", "amount": int(dep)})
+                save_account(acct)
+                st.success(f"Added {money(dep)} to your account.")
+                _rerun()
 
     st.markdown("#### Automation — set it and forget it")
     a1, a2 = st.columns(2)
@@ -703,20 +764,21 @@ if ss.view == "home":
     st.stop()
 
 
-# ================= ADVANCED (ANALYTICS) =================
-if st.button("← Back to home"):
-    ss.view = "home"
-    _rerun()
+# ================= ANALYTICS =================
+bb1, bb2 = st.columns([4, 1])
+with bb1:
+    if st.button("← Back to home"):
+        ss.view = "home"
+        _rerun()
+with bb2:
+    if st.button("↻ Refresh", use_container_width=True):
+        st.cache_data.clear()
+        _rerun()
 
 st.markdown(f'<div class="acct-bar"><span class="acct-name">{name}\'s account · detailed analytics</span><span class="acct-val">{money(current_value)}</span></div>', unsafe_allow_html=True)
 
-try:
-    ANTHROPIC_KEY = st.secrets["ANTHROPIC_API_KEY"]
-except Exception:
-    ANTHROPIC_KEY = None
-
 if prices is None or prices.empty:
-    st.warning("Market data is taking a moment to load. Try again, or switch on Demo mode in Settings → Advanced.")
+    st.warning("Market data is taking a moment to load. Hit Refresh, or switch on Demo mode in Settings → Advanced.")
     st.stop()
 
 try:
@@ -740,13 +802,13 @@ try:
     tab_plan, tab_invest, tab_track = st.tabs(["Plan", "Invest", "Track"])
 
     with tab_plan:
-        st.markdown('<div class="feature-card"><div class="card-title">Your plan</div><div class="card-text">Recommended mix and projection for your goal.</div></div>', unsafe_allow_html=True)
+        st.markdown('<div class="feature-card"><div class="card-title">Your plan</div><div class="card-text">Target balance and projection for your goal.</div></div>', unsafe_allow_html=True)
         adf = pd.DataFrame({"Asset Class": list(allocation.keys()), "Allocation (%)": list(allocation.values())})
         c1, c2 = st.columns(2)
         with c1:
             st.dataframe(adf, use_container_width=True, hide_index=True)
         with c2:
-            st.plotly_chart(apply_clean_theme(px.pie(adf, names="Asset Class", values="Allocation (%)", hole=0.55, title="Recommended Allocation", color_discrete_sequence=COLORS)), use_container_width=True)
+            st.plotly_chart(apply_clean_theme(px.pie(adf, names="Asset Class", values="Allocation (%)", hole=0.55, title="Target Balance", color_discrete_sequence=COLORS)), use_container_width=True)
         pr = st.slider("Planning return assumption (%)", 1, 15, int(assumed_return * 100)) / 100
         proj = wealth_projection(current_value, effective_monthly, pr, horizon, contribution_growth)
         sched = income_schedule(income, monthly, salary_growth, contribution_growth, horizon)
@@ -763,19 +825,38 @@ try:
             st.dataframe(d, use_container_width=True, hide_index=True)
 
     with tab_invest:
-        src = "your own tickers" if ss.use_own_tickers else "your recommended allocation (VTI / BND / BIL)"
-        st.markdown(f'<div class="feature-card"><div class="card-title">Your portfolio</div><div class="card-text">Built from {src}. Change this in Settings → Advanced.</div></div>', unsafe_allow_html=True)
-        wdf = pd.DataFrame({"Holding": tickers, "Weight": [f"{w:.1%}" for w in weights]})
-        cc1, cc2 = st.columns(2)
-        with cc1:
+        src = "your own tickers" if ss.use_own_tickers else ("your AI advisor" if ai_built else "your recommended allocation")
+        st.markdown(f'<div class="feature-card"><div class="card-title">Your portfolio</div><div class="card-text">Built by {src}.</div></div>', unsafe_allow_html=True)
+
+        if ai_built and portfolio_summary:
+            st.markdown(f'<div class="advisor-box"><span class="ai-tag">AI strategy</span><br><br>{portfolio_summary}</div>', unsafe_allow_html=True)
+
+        if ai_built and ai_port.get("holdings"):
+            st.write("")
+            for h in ai_port["holdings"]:
+                if h["ticker"] in tickers:
+                    st.markdown(f'<div class="hold"><div class="hold-tk">{h["ticker"]}</div><div class="hold-bartrack"><div class="hold-barfill" style="width:{min(h["weight"],100):.0f}%"></div></div><div class="hold-w">{h["weight"]:.0f}%</div></div><div class="hold-reason">{h.get("reason","")}</div>', unsafe_allow_html=True)
+        else:
+            wdf = pd.DataFrame({"Holding": tickers, "Weight": [f"{w:.1%}" for w in weights]})
             st.dataframe(wdf, use_container_width=True, hide_index=True)
-        with cc2:
-            st.plotly_chart(apply_clean_theme(px.pie(pd.DataFrame({"Holding": tickers, "Weight": weights}), names="Holding", values="Weight", hole=0.55, title="Holdings", color_discrete_sequence=COLORS)), use_container_width=True)
+
+        if ANTHROPIC_KEY:
+            if st.button("↻ Regenerate portfolio with AI"):
+                with st.spinner("Rebuilding your portfolio…"):
+                    ai = build_ai_portfolio(ANTHROPIC_KEY, {"age": age, "risk": risk_tol, "horizon": horizon, "goal": goal_name, "monthly": monthly})
+                if ai:
+                    acct["ai_portfolio"] = ai
+                    save_account(acct)
+                    _rerun()
+                else:
+                    st.caption("Couldn't regenerate right now — keeping your current portfolio.")
+
         im1, im2, im3, im4 = st.columns(4)
         im1.metric("Expected Return", f"{er:.2%}")
         im2.metric("Volatility", f"{vol:.2%}")
         im3.metric("Sharpe Ratio", f"{sharpe:.2f}")
         im4.metric("Health Score", f"{health_score(len(tickers), vol, sharpe)}/100")
+
         fig_g = go.Figure()
         for i, tk in enumerate(normalized.columns):
             fig_g.add_trace(go.Scatter(x=normalized.index, y=normalized[tk], mode="lines", name=tk, line=dict(width=3, color=COLORS[i % len(COLORS)])))
@@ -787,6 +868,7 @@ try:
             pass
         fig_g.update_layout(title="Growth of $100 vs S&P 500", xaxis_title="Date", yaxis_title="Indexed Value")
         st.plotly_chart(apply_clean_theme(fig_g), use_container_width=True)
+
         if len(tickers) >= 2:
             with st.expander("How your holdings move together"):
                 st.plotly_chart(apply_clean_theme(px.imshow(returns.corr(), text_auto=True, title="Correlation Matrix", color_continuous_scale=["#10B981", "#FFFFFF", "#EF4444"])), use_container_width=True)
@@ -846,17 +928,11 @@ try:
 
     st.markdown('<div class="feature-card"><div class="card-title">AI Advisor Summary</div><div class="card-text">A plain-English read on your plan.</div></div>', unsafe_allow_html=True)
     recs = advisor_bullets(risk_tol, horizon, score, vol, sharpe, allocation, market_label, port_dy)
-    if ANTHROPIC_KEY and st.button("Generate AI advisor note"):
-        profile = {"age": age, "risk": risk_tol, "horizon": horizon, "income": income, "value": current_value, "monthly": monthly, "score": score}
-        metrics = {"er": er, "vol": vol, "sharpe": sharpe, "dy": port_dy}
-        note = generate_ai_note(ANTHROPIC_KEY, profile, metrics, allocation, market_label or "unavailable")
-        if note:
-            st.markdown(f'<div class="advisor-box">{note}</div>', unsafe_allow_html=True)
     for r in recs:
         st.markdown(f"- {r}")
 
 except Exception:
-    st.warning("Something went wrong loading the analytics. Try again, or switch on Demo mode in Settings → Advanced.")
+    st.warning("Something went wrong loading the analytics. Hit Refresh, or switch on Demo mode in Settings → Advanced.")
 
 st.divider()
 st.caption("Built with Streamlit, yfinance, pandas, numpy, and plotly. Educational prototype only. Not financial advice.")
