@@ -34,6 +34,14 @@ def toggle(label, key):
         return st.checkbox(label, key=key)
 
 
+def card():
+    # A bordered container that actually wraps Streamlit widgets (raw HTML divs can't).
+    try:
+        return st.container(border=True)
+    except TypeError:
+        return st.container()
+
+
 def _safe(name):
     return "".join(c for c in str(name).lower() if c.isalnum() or c in ("-", "_")) or "user"
 
@@ -417,6 +425,21 @@ ss.setdefault("user", None)
 ss.setdefault("view", "home")
 ss.setdefault("onb_active", False)
 ss.setdefault("onb_step", 1)
+# Automation toggles (always present so they default ON and never error)
+ss.setdefault("auto_deposit", True)
+ss.setdefault("auto_rebalance", True)
+ss.setdefault("auto_dividend", True)
+ss.setdefault("auto_tlh", True)
+# Onboarding answers kept in plain keys (NOT widget keys) so they survive step changes
+ss.setdefault("ans_name", "")
+ss.setdefault("ans_goal", "Retirement")
+ss.setdefault("ans_target", 1000000)
+ss.setdefault("ans_age", 28)
+ss.setdefault("ans_income", 60000)
+ss.setdefault("ans_horizon", 30)
+ss.setdefault("ans_monthly", 1000)
+ss.setdefault("ans_risk", "Moderate")
+ss.setdefault("ans_opening", 10000)
 
 
 def seed_keys(a):
@@ -445,88 +468,86 @@ if ss.user is None:
     if not ss.onb_active:
         cl, cc, cr = st.columns([1, 4, 1])
         with cc:
-            st.markdown('<div class="onb-card">', unsafe_allow_html=True)
-            st.subheader("Welcome to FinPilot")
-            st.write("Open an account and we'll handle the investing for you.")
-            existing = list_accounts()
-            if existing:
-                st.caption("Continue with an existing account")
-                for nm in existing:
-                    if st.button(f"Continue as {nm}", key=f"cont_{nm}", use_container_width=True):
-                        a = load_account(nm)
-                        seed_keys(a)
-                        ss.user = nm
-                        ss.view = "home"
-                        _rerun()
-                st.divider()
-            if st.button("Open a new account", use_container_width=True):
-                ss.onb_active = True
-                ss.onb_step = 1
-                _rerun()
-            st.markdown('</div>', unsafe_allow_html=True)
+            with card():
+                st.subheader("Welcome to FinPilot")
+                st.write("Open an account and we'll handle the investing for you.")
+                existing = list_accounts()
+                if existing:
+                    st.caption("Continue with an existing account")
+                    for nm in existing:
+                        if st.button(f"Continue as {nm}", key=f"cont_{nm}", use_container_width=True):
+                            a = load_account(nm)
+                            seed_keys(a)
+                            ss.user = nm
+                            ss.view = "home"
+                            _rerun()
+                    st.divider()
+                if st.button("Open a new account", use_container_width=True):
+                    ss.onb_active = True
+                    ss.onb_step = 1
+                    _rerun()
         st.caption("Educational prototype only. Not financial advice.")
         st.stop()
 
-    # onboarding wizard
+    # onboarding wizard (answers stored in plain ans_ keys so they survive step changes)
     step = ss.onb_step
     cl, cc, cr = st.columns([1, 4, 1])
     with cc:
-        st.markdown('<div class="onb-card">', unsafe_allow_html=True)
-        st.caption(f"Step {step} of 4")
-        if step == 1:
-            st.subheader("Let's build your plan")
-            st.text_input("What should we call you?", key="k_name", placeholder="Your name")
-            st.selectbox("What are you investing for?", GOALS, key="k_goal")
-            st.number_input("Target amount ($)", min_value=0, value=ss.get("k_target", 1000000), step=50000, key="k_target")
-        elif step == 2:
-            st.subheader("A little about you")
-            c1, c2 = st.columns(2)
-            with c1:
-                st.number_input("Age", 18, 100, value=ss.get("k_age", 28), key="k_age")
-                st.number_input("Annual income ($)", min_value=0, value=ss.get("k_income", 60000), step=5000, key="k_income")
-            with c2:
-                st.slider("Years until your goal", 1, 40, value=ss.get("k_horizon", 30), key="k_horizon")
-                st.number_input("Monthly contribution ($)", min_value=0, value=ss.get("k_monthly", 1000), step=100, key="k_monthly")
-        elif step == 3:
-            st.subheader("How do you feel about risk?")
-            st.radio("Pick what sounds most like you", RISKS, key="k_risk",
-                     captions=["Protect what I have — smaller swings", "A balance of growth and safety", "Grow as much as possible — I can handle big swings"])
-        else:
-            st.subheader("Fund your account")
-            st.write("How much would you like to start with? You can add more anytime.")
-            st.number_input("Opening deposit ($)", min_value=0, value=10000, step=1000, key="k_opening")
-
-        b1, b2 = st.columns(2)
-        with b1:
-            if step > 1 and st.button("Back", use_container_width=True):
-                ss.onb_step -= 1
-                _rerun()
-        with b2:
-            if step < 4:
-                if st.button("Continue", use_container_width=True):
-                    ss.onb_step += 1
-                    _rerun()
+        with card():
+            st.caption(f"Step {step} of 4")
+            if step == 1:
+                st.subheader("Let's build your plan")
+                ss.ans_name = st.text_input("What should we call you?", value=ss.ans_name, placeholder="Your name")
+                ss.ans_goal = st.selectbox("What are you investing for?", GOALS, index=GOALS.index(ss.ans_goal))
+                ss.ans_target = st.number_input("Target amount ($)", min_value=0, value=int(ss.ans_target), step=50000)
+            elif step == 2:
+                st.subheader("A little about you")
+                c1, c2 = st.columns(2)
+                with c1:
+                    ss.ans_age = st.number_input("Age", 18, 100, value=int(ss.ans_age))
+                    ss.ans_income = st.number_input("Annual income ($)", min_value=0, value=int(ss.ans_income), step=5000)
+                with c2:
+                    ss.ans_horizon = st.slider("Years until your goal", 1, 40, value=int(ss.ans_horizon))
+                    ss.ans_monthly = st.number_input("Monthly contribution ($)", min_value=0, value=int(ss.ans_monthly), step=100)
+            elif step == 3:
+                st.subheader("How do you feel about risk?")
+                ss.ans_risk = st.radio("Pick what sounds most like you", RISKS, index=RISKS.index(ss.ans_risk),
+                                       captions=["Protect what I have — smaller swings", "A balance of growth and safety", "Grow as much as possible — I can handle big swings"])
             else:
-                if st.button("Open my account", use_container_width=True):
-                    name = ss.get("k_name") or "Investor"
-                    opening = int(ss.get("k_opening", 0))
-                    acct = {
-                        "name": name, "created": dt.date.today().isoformat(),
-                        "goal": ss.k_goal, "target": int(ss.k_target), "age": int(ss.k_age),
-                        "income": int(ss.k_income), "monthly": int(ss.k_monthly), "risk": ss.k_risk,
-                        "horizon": int(ss.k_horizon), "salary_growth": 5,
-                        "invested": opening,
-                        "transactions": [{"date": dt.date.today().isoformat(), "type": "Opening deposit", "amount": opening}],
-                        "auto_deposit": True, "auto_rebalance": True, "auto_dividend": True, "auto_tlh": True,
-                        "use_own": False, "tickers": "AAPL, MSFT, NVDA, SPY, VYM", "weights_text": "",
-                    }
-                    save_account(acct)
-                    seed_keys(acct)
-                    ss.user = name
-                    ss.onb_active = False
-                    ss.view = "home"
+                st.subheader("Fund your account")
+                st.write("How much would you like to start with? You can add more anytime.")
+                ss.ans_opening = st.number_input("Opening deposit ($)", min_value=0, value=int(ss.ans_opening), step=1000)
+
+            b1, b2 = st.columns(2)
+            with b1:
+                if step > 1 and st.button("Back", use_container_width=True):
+                    ss.onb_step -= 1
                     _rerun()
-        st.markdown('</div>', unsafe_allow_html=True)
+            with b2:
+                if step < 4:
+                    if st.button("Continue", use_container_width=True):
+                        ss.onb_step += 1
+                        _rerun()
+                else:
+                    if st.button("Open my account", use_container_width=True):
+                        name = ss.ans_name or "Investor"
+                        opening = int(ss.ans_opening)
+                        acct = {
+                            "name": name, "created": dt.date.today().isoformat(),
+                            "goal": ss.ans_goal, "target": int(ss.ans_target), "age": int(ss.ans_age),
+                            "income": int(ss.ans_income), "monthly": int(ss.ans_monthly), "risk": ss.ans_risk,
+                            "horizon": int(ss.ans_horizon), "salary_growth": 5,
+                            "invested": opening,
+                            "transactions": [{"date": dt.date.today().isoformat(), "type": "Opening deposit", "amount": opening}],
+                            "auto_deposit": True, "auto_rebalance": True, "auto_dividend": True, "auto_tlh": True,
+                            "use_own": False, "tickers": "AAPL, MSFT, NVDA, SPY, VYM", "weights_text": "",
+                        }
+                        save_account(acct)
+                        seed_keys(acct)
+                        ss.user = name
+                        ss.onb_active = False
+                        ss.view = "home"
+                        _rerun()
     st.caption("Educational prototype only. Not financial advice.")
     st.stop()
 
@@ -535,17 +556,19 @@ if ss.user is None:
 acct = load_account(ss.user) or {}
 
 # Settings live in the (collapsed) sidebar so the main screen stays product-like.
+name = ss.user
 st.sidebar.title("Settings")
 st.sidebar.header("Goal")
-st.sidebar.selectbox("Investing for", GOALS, key="k_goal")
-st.sidebar.number_input("Target ($)", min_value=0, step=50000, key="k_target")
+goal_name = st.sidebar.selectbox("Investing for", GOALS, key="k_goal")
+goal_target = int(st.sidebar.number_input("Target ($)", min_value=0, step=50000, key="k_target"))
 st.sidebar.header("About you")
-st.sidebar.number_input("Age", 18, 100, key="k_age")
-st.sidebar.number_input("Annual income ($)", min_value=0, step=5000, key="k_income")
-st.sidebar.number_input("Monthly contribution ($)", min_value=0, step=100, key="k_monthly")
-st.sidebar.selectbox("Risk comfort", RISKS, key="k_risk")
-st.sidebar.slider("Years until goal", 1, 40, key="k_horizon")
-st.sidebar.slider("Annual salary growth (%)", 0, 20, key="k_salary")
+age = int(st.sidebar.number_input("Age", 18, 100, key="k_age"))
+income = int(st.sidebar.number_input("Annual income ($)", min_value=0, step=5000, key="k_income"))
+monthly = int(st.sidebar.number_input("Monthly contribution ($)", min_value=0, step=100, key="k_monthly"))
+risk_tol = st.sidebar.selectbox("Risk comfort", RISKS, key="k_risk")
+horizon = int(st.sidebar.slider("Years until goal", 1, 40, key="k_horizon"))
+salary_growth = st.sidebar.slider("Annual salary growth (%)", 0, 20, key="k_salary") / 100
+contribution_growth = salary_growth
 with st.sidebar.expander("Advanced settings"):
     use_own = st.checkbox("Use my own tickers", key="use_own_tickers")
     ticker_input = st.text_input("Tickers", key="k_tickers") if use_own else "VTI, BND, BIL"
@@ -557,13 +580,6 @@ if st.sidebar.button("Log out"):
     ss.user = None
     _rerun()
 
-# Read current settings
-name = ss.user
-goal_name, goal_target = ss.k_goal, int(ss.k_target)
-age, income, monthly = int(ss.k_age), int(ss.k_income), int(ss.k_monthly)
-risk_tol, horizon = ss.k_risk, int(ss.k_horizon)
-salary_growth = ss.k_salary / 100
-contribution_growth = salary_growth
 auto_deposit_on = ss.get("auto_deposit", True)
 effective_monthly = monthly if auto_deposit_on else 0
 assumed_return = {"Conservative": 0.05, "Moderate": 0.07, "Aggressive": 0.09}[risk_tol]
@@ -572,10 +588,10 @@ score = risk_score(age, risk_tol, horizon, monthly, income)
 
 # Persist edited settings back to the account
 acct.update({"goal": goal_name, "target": goal_target, "age": age, "income": income, "monthly": monthly,
-             "risk": risk_tol, "horizon": horizon, "salary_growth": ss.k_salary,
-             "auto_deposit": ss.auto_deposit, "auto_rebalance": ss.auto_rebalance,
-             "auto_dividend": ss.auto_dividend, "auto_tlh": ss.auto_tlh,
-             "use_own": ss.use_own_tickers, "tickers": ss.get("k_tickers", ""), "weights_text": ss.get("k_weights", "")})
+             "risk": risk_tol, "horizon": horizon, "salary_growth": int(salary_growth * 100),
+             "auto_deposit": ss.get("auto_deposit", True), "auto_rebalance": ss.get("auto_rebalance", True),
+             "auto_dividend": ss.get("auto_dividend", True), "auto_tlh": ss.get("auto_tlh", True),
+             "use_own": ss.get("use_own_tickers", False), "tickers": ss.get("k_tickers", ""), "weights_text": ss.get("k_weights", "")})
 save_account(acct)
 
 invested = float(acct.get("invested", 0))
