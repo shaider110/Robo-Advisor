@@ -284,6 +284,34 @@ Return ONLY valid JSON (no markdown, no prose) in exactly this shape:
         return None
 
 
+def build_smart_portfolio(profile):
+    """Rule-based portfolio in the SAME shape as the AI one, so the experience shows
+    even without an API key. Picks from the curated universe based on risk and horizon."""
+    risk, horizon = profile["risk"], profile["horizon"]
+    alloc = recommend_allocation(profile["age"], risk, horizon)
+    eq, bd, csh = alloc["Equity"], alloc["Bonds / Fixed Income"], alloc["Cash"]
+    if risk == "Aggressive":
+        eq_split = [("VTI", 0.40, "Total US market core"), ("QQQ", 0.25, "Growth tilt for the long horizon"),
+                    ("VXUS", 0.20, "International diversification"), ("NVDA", 0.15, "High-growth large-cap")]
+    elif risk == "Moderate":
+        eq_split = [("VTI", 0.50, "Total US market core"), ("SCHD", 0.25, "Quality dividend payers"),
+                    ("VXUS", 0.25, "International diversification")]
+    else:
+        eq_split = [("VTI", 0.60, "Broad, steady core"), ("SCHD", 0.40, "Dividend stability")]
+    holdings = [{"ticker": tk, "weight": round(eq * frac, 1), "reason": rs} for tk, frac, rs in eq_split]
+    if bd > 0:
+        holdings.append({"ticker": "BND", "weight": round(bd, 1), "reason": "Investment-grade bonds for stability"})
+    if csh > 0:
+        holdings.append({"ticker": "BIL", "weight": round(csh, 1), "reason": "T-bills for safety and liquidity"})
+    tot = sum(h["weight"] for h in holdings) or 1
+    for h in holdings:
+        h["weight"] = round(h["weight"] / tot * 100, 1)
+    summary = (f"A {risk.lower()} portfolio for a {horizon}-year horizon: about {eq}% equities, "
+               f"{bd}% bonds and {csh}% cash, diversified across US, international, and defensive assets, "
+               f"and rebalanced to these targets over time.")
+    return {"summary": summary, "holdings": holdings}
+
+
 def risk_score(age, risk, horizon, monthly, income):
     s = 50
     s += 15 if age < 30 else (-15 if age > 55 else 0)
@@ -585,10 +613,11 @@ if ss.user is None:
                             "auto_deposit": True, "auto_rebalance": True, "auto_dividend": True, "auto_tlh": True,
                             "use_own": False, "tickers": "AAPL, MSFT, NVDA, SPY, VYM", "weights_text": "",
                         }
+                        prof = {"age": acct["age"], "risk": acct["risk"], "horizon": acct["horizon"], "goal": acct["goal"], "monthly": acct["monthly"]}
                         with st.spinner("Your AI advisor is building your portfolio…"):
-                            ai = build_ai_portfolio(ANTHROPIC_KEY, {"age": acct["age"], "risk": acct["risk"], "horizon": acct["horizon"], "goal": acct["goal"], "monthly": acct["monthly"]})
-                        if ai:
-                            acct["ai_portfolio"] = ai
+                            ai = build_ai_portfolio(ANTHROPIC_KEY, prof)
+                        acct["portfolio_source"] = "ai" if ai else "model"
+                        acct["ai_portfolio"] = ai if ai else build_smart_portfolio(prof)
                         save_account(acct)
                         seed_keys(acct)
                         ss.user = name
