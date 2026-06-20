@@ -500,9 +500,10 @@ ss.setdefault("onb_active", False)
 ss.setdefault("onb_step", 1)
 for k in ("auto_deposit", "auto_rebalance", "auto_dividend", "auto_tlh"):
     ss.setdefault(k, True)
-for k, v in {"ans_name": "", "ans_goal": "Retirement", "ans_target": 1000000, "ans_age": 28,
-             "ans_income": 60000, "ans_horizon": 30, "ans_monthly": 1000, "ans_risk": "Moderate",
-             "ans_opening": 10000}.items():
+ANS_DEFAULTS = {"ans_name": "", "ans_goal": "Retirement", "ans_target": 1000000, "ans_age": 28,
+                "ans_income": 60000, "ans_horizon": 30, "ans_monthly": 1000, "ans_risk": "Moderate",
+                "ans_opening": 10000}
+for k, v in ANS_DEFAULTS.items():
     ss.setdefault(k, v)
 
 try:
@@ -544,6 +545,10 @@ if ss.user is None:
                 with card():
                     st.write("New here? Open an account in under a minute and we'll build your portfolio.")
                     if st.button("Get started", use_container_width=True):
+                        for wk in [k for k in ss.keys() if k.startswith("w_")]:
+                            del ss[wk]
+                        for k, v in ANS_DEFAULTS.items():
+                            ss[k] = v
                         ss.onb_active = True
                         ss.onb_step = 1
                         _rerun()
@@ -563,32 +568,42 @@ if ss.user is None:
             st.caption("Educational prototype only. Not financial advice.")
             st.stop()
 
-        # onboarding wizard (answers in plain ans_ keys so they survive step changes)
+        # onboarding wizard: each input uses a stable w_ key seeded from the saved ans_ value,
+        # so values don't lag and still survive moving between steps.
         step = ss.onb_step
         with card():
             st.caption(f"Step {step} of 4")
             if step == 1:
                 st.subheader("Let's build your plan")
-                ss.ans_name = st.text_input("What should we call you?", value=ss.ans_name, placeholder="Your name")
-                ss.ans_goal = st.selectbox("What are you investing for?", GOALS, index=GOALS.index(ss.ans_goal))
-                ss.ans_target = st.number_input("Target amount ($)", min_value=0, value=int(ss.ans_target), step=50000)
+                ss.setdefault("w_name", ss.ans_name)
+                ss.ans_name = st.text_input("What should we call you?", key="w_name", placeholder="Your name")
+                ss.setdefault("w_goal", ss.ans_goal)
+                ss.ans_goal = st.selectbox("What are you investing for?", GOALS, key="w_goal")
+                ss.setdefault("w_target", int(ss.ans_target))
+                ss.ans_target = st.number_input("Target amount ($)", min_value=0, step=50000, key="w_target")
             elif step == 2:
                 st.subheader("A little about you")
                 c1, c2 = st.columns(2)
                 with c1:
-                    ss.ans_age = st.number_input("Age", 18, 100, value=int(ss.ans_age))
-                    ss.ans_income = st.number_input("Annual income ($)", min_value=0, value=int(ss.ans_income), step=5000)
+                    ss.setdefault("w_age", int(ss.ans_age))
+                    ss.ans_age = st.number_input("Age", 18, 100, key="w_age")
+                    ss.setdefault("w_income", int(ss.ans_income))
+                    ss.ans_income = st.number_input("Annual income ($)", min_value=0, step=5000, key="w_income")
                 with c2:
-                    ss.ans_horizon = st.slider("Years until your goal", 1, 40, value=int(ss.ans_horizon))
-                    ss.ans_monthly = st.number_input("Monthly contribution ($)", min_value=0, value=int(ss.ans_monthly), step=100)
+                    ss.setdefault("w_horizon", int(ss.ans_horizon))
+                    ss.ans_horizon = st.slider("Years until your goal", 1, 40, key="w_horizon")
+                    ss.setdefault("w_monthly", int(ss.ans_monthly))
+                    ss.ans_monthly = st.number_input("Monthly contribution ($)", min_value=0, step=100, key="w_monthly")
             elif step == 3:
                 st.subheader("How do you feel about risk?")
-                ss.ans_risk = st.radio("Pick what sounds most like you", RISKS, index=RISKS.index(ss.ans_risk),
+                ss.setdefault("w_risk", ss.ans_risk)
+                ss.ans_risk = st.radio("Pick what sounds most like you", RISKS, key="w_risk",
                                        captions=["Protect what I have — smaller swings", "A balance of growth and safety", "Grow as much as possible — I can handle big swings"])
             else:
                 st.subheader("Fund your account")
                 st.write("How much would you like to start with? You can add more anytime.")
-                ss.ans_opening = st.number_input("Opening deposit ($)", min_value=0, value=int(ss.ans_opening), step=1000)
+                ss.setdefault("w_opening", int(ss.ans_opening))
+                ss.ans_opening = st.number_input("Opening deposit ($)", min_value=0, step=1000, key="w_opening")
 
             b1, b2 = st.columns(2)
             with b1:
@@ -671,6 +686,17 @@ save_account(acct)
 invested = float(acct.get("invested", 0))
 transactions = acct.get("transactions", [])
 ai_port = acct.get("ai_portfolio")
+port_source = acct.get("portfolio_source", "model")
+
+# Older accounts (or any without a portfolio) get one built now so the experience always shows.
+if ai_port is None and not ss.get("use_own_tickers", False):
+    prof = {"age": age, "risk": risk_tol, "horizon": horizon, "goal": goal_name, "monthly": monthly}
+    built = build_ai_portfolio(ANTHROPIC_KEY, prof)
+    port_source = "ai" if built else "model"
+    ai_port = built if built else build_smart_portfolio(prof)
+    acct["ai_portfolio"] = ai_port
+    acct["portfolio_source"] = port_source
+    save_account(acct)
 
 mc_read = market_conditions(demo_mode)
 market_label = mc_read["label"] if mc_read else None
@@ -727,7 +753,7 @@ if ss.view == "home":
     gcls = "gain-pos" if gain >= 0 else "gain-neg"
     gsign = "+" if gain >= 0 else "−"
     pill = '<span class="pill-ok">On track</span>' if on_track else '<span class="pill-warn">Needs a nudge</span>'
-    ai_chip = '<span class="ai-tag">AI-built</span>' if ai_built else ''
+    ai_chip = ('<span class="ai-tag">AI-built</span>' if port_source == "ai" else '<span class="ai-tag">Auto-built</span>') if ai_built else ''
     if on_track:
         adv = f"You're on track to reach your {goal_name.lower()} goal of {money_short(goal_target)}. Keeping your {money(monthly)}/month deposit going gets you there with room to spare."
     else:
@@ -854,11 +880,17 @@ try:
             st.dataframe(d, use_container_width=True, hide_index=True)
 
     with tab_invest:
-        src = "your own tickers" if ss.use_own_tickers else ("your AI advisor" if ai_built else "your recommended allocation")
+        if ss.use_own_tickers:
+            src = "your own tickers"
+        elif port_source == "ai":
+            src = "your AI advisor"
+        else:
+            src = "FinPilot's model"
         st.markdown(f'<div class="feature-card"><div class="card-title">Your portfolio</div><div class="card-text">Built by {src}.</div></div>', unsafe_allow_html=True)
 
+        strategy_tag = "AI strategy" if port_source == "ai" else "Strategy"
         if ai_built and portfolio_summary:
-            st.markdown(f'<div class="advisor-box"><span class="ai-tag">AI strategy</span><br><br>{portfolio_summary}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="advisor-box"><span class="ai-tag">{strategy_tag}</span><br><br>{portfolio_summary}</div>', unsafe_allow_html=True)
 
         if ai_built and ai_port.get("holdings"):
             st.write("")
@@ -869,16 +901,17 @@ try:
             wdf = pd.DataFrame({"Holding": tickers, "Weight": [f"{w:.1%}" for w in weights]})
             st.dataframe(wdf, use_container_width=True, hide_index=True)
 
-        if ANTHROPIC_KEY:
-            if st.button("↻ Regenerate portfolio with AI"):
-                with st.spinner("Rebuilding your portfolio…"):
-                    ai = build_ai_portfolio(ANTHROPIC_KEY, {"age": age, "risk": risk_tol, "horizon": horizon, "goal": goal_name, "monthly": monthly})
-                if ai:
-                    acct["ai_portfolio"] = ai
-                    save_account(acct)
-                    _rerun()
-                else:
-                    st.caption("Couldn't regenerate right now — keeping your current portfolio.")
+        rebuild_label = "↻ Regenerate portfolio with AI" if ANTHROPIC_KEY else "↻ Rebuild my portfolio"
+        if not ss.use_own_tickers and st.button(rebuild_label):
+            prof = {"age": age, "risk": risk_tol, "horizon": horizon, "goal": goal_name, "monthly": monthly}
+            with st.spinner("Rebuilding your portfolio…"):
+                ai = build_ai_portfolio(ANTHROPIC_KEY, prof)
+            acct["portfolio_source"] = "ai" if ai else "model"
+            acct["ai_portfolio"] = ai if ai else build_smart_portfolio(prof)
+            save_account(acct)
+            _rerun()
+        if not ANTHROPIC_KEY:
+            st.caption("Add an Anthropic API key in secrets to have a live AI build this instead of the rule-based model.")
 
         im1, im2, im3, im4 = st.columns(4)
         im1.metric("Expected Return", f"{er:.2%}")
