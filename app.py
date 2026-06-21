@@ -634,6 +634,7 @@ if ss.user is None:
                             ai = build_ai_portfolio(ANTHROPIC_KEY, prof)
                         acct["portfolio_source"] = "ai" if ai else "model"
                         acct["ai_portfolio"] = ai if ai else build_smart_portfolio(prof)
+                        acct["built_for"] = {"risk": acct["risk"], "horizon": acct["horizon"], "age": acct["age"]}
                         save_account(acct)
                         seed_keys(acct)
                         ss.user = name
@@ -689,14 +690,18 @@ transactions = acct.get("transactions", [])
 ai_port = acct.get("ai_portfolio")
 port_source = acct.get("portfolio_source", "model")
 
-# Older accounts (or any without a portfolio) get one built now so the experience always shows.
-if ai_port is None and not ss.get("use_own_tickers", False):
+# Rebuild the portfolio when it's missing OR when the inputs that should drive it have changed.
+profile_key = {"risk": risk_tol, "horizon": horizon, "age": age}
+needs_build = (not ss.get("use_own_tickers", False)) and (ai_port is None or acct.get("built_for") != profile_key)
+if needs_build:
     prof = {"age": age, "risk": risk_tol, "horizon": horizon, "goal": goal_name, "monthly": monthly}
-    built = build_ai_portfolio(ANTHROPIC_KEY, prof)
+    # Keep it AI-built if this account uses AI and a key is available; otherwise re-tilt instantly with the model.
+    built = build_ai_portfolio(ANTHROPIC_KEY, prof) if (ANTHROPIC_KEY and port_source == "ai") else None
     port_source = "ai" if built else "model"
     ai_port = built if built else build_smart_portfolio(prof)
     acct["ai_portfolio"] = ai_port
     acct["portfolio_source"] = port_source
+    acct["built_for"] = profile_key
     save_account(acct)
 
 mc_read = market_conditions(demo_mode)
@@ -909,6 +914,7 @@ try:
                 ai = build_ai_portfolio(ANTHROPIC_KEY, prof)
             acct["portfolio_source"] = "ai" if ai else "model"
             acct["ai_portfolio"] = ai if ai else build_smart_portfolio(prof)
+            acct["built_for"] = {"risk": risk_tol, "horizon": horizon, "age": age}
             save_account(acct)
             _rerun()
         if not ANTHROPIC_KEY:
